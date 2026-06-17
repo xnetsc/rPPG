@@ -46,24 +46,34 @@
     overflow: hidden;
     background: #050810;
     box-shadow: 0 0 30px #1a2a5040;
-    /* Enforce 4:3 on mobile so face fills the frame */
-    aspect-ratio: 4/3;
   }
 
   #video {
     display: block;
     width: 100%;
-    height: 100%;
-    object-fit: cover;
+    height: auto;       /* natural aspect ratio, no cropping */
     transform: scaleX(-1);
   }
 
-  /* Overlay is NOT CSS-mirrored; we flip coordinates in JS instead so
-     the drawn boxes visually match the mirrored video. */
   #overlay {
     position: absolute;
     inset: 0;
     pointer-events: none;
+  }
+
+  /* Guide label above the ROI box */
+  .guide-label {
+    position: absolute;
+    top: 8px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: #00000077;
+    color: #00e676;
+    font-size: 0.72rem;
+    padding: 3px 10px;
+    border-radius: 10px;
+    pointer-events: none;
+    white-space: nowrap;
   }
 
   .status-badge {
@@ -254,6 +264,7 @@
   <div class="video-wrap">
     <video id="video" autoplay playsinline muted></video>
     <canvas id="overlay"></canvas>
+    <div class="guide-label">👆 将额头对准此处</div>
     <div class="status-badge">
       <div class="dot" id="statusDot"></div>
       <span id="statusText">等待摄像头</span>
@@ -727,18 +738,15 @@ async function loop() {
 // ═══════════════════════════════════════════════════════════════
 // ROI — forehead region inside face box (or center crop fallback)
 // ═══════════════════════════════════════════════════════════════
+// ROI is fixed at the top-center of the frame — the guide box shown to
+// the user matches this region exactly, so they know where to position their forehead.
 function getROI() {
   const vw = video.videoWidth, vh = video.videoHeight;
-  // MediaPipe short-model bounding boxes often only cover the lower face
-  // (nose→chin), making face-relative forehead math unreliable.
-  // For selfie mode the forehead is always in the upper-center of the frame,
-  // so we use a fixed region there and only use face detection for x-centering.
-  const cx = faceBox ? (faceBox.x + faceBox.w / 2) : vw / 2;
-  const w = Math.round(vw * 0.48);
-  const h = Math.round(vh * 0.22);
-  const x = Math.round(cx - w / 2);
-  const y = Math.round(vh * 0.06);          // top 6–28% = forehead region
-  return clampROI({ x, y, w, h }, vw, vh);
+  const w = Math.round(vw * 0.52);
+  const h = Math.round(vh * 0.24);
+  const x = Math.round((vw - w) / 2);
+  const y = Math.round(vh * 0.04);
+  return { x, y, w, h };
 }
 
 function clampROI(r, vw, vh) {
@@ -1037,33 +1045,39 @@ function drawSpectrum(freqs, psd, peakHz) {
 // ═══════════════════════════════════════════════════════════════
 function drawOverlay(roi) {
   if (!overlayCtx) return;
-  const W = overlay.width;
-  overlayCtx.clearRect(0, 0, W, overlay.height);
+  const W = overlay.width, H = overlay.height;
+  overlayCtx.clearRect(0, 0, W, H);
 
-  // The video is CSS-mirrored (scaleX(-1)) but the overlay canvas is NOT.
-  // To align drawn boxes with the displayed video, flip x coordinates:
-  //   display_x = W - original_x - box_width
-  const flip = (x, w) => W - x - w;
+  // ROI is symmetric and centered horizontally, so mirroring doesn't affect its position.
+  // Draw the guide box directly at ROI coordinates.
+  const { x, y, w, h } = roi;
 
-  // Face box
-  if (faceBox) {
-    overlayCtx.strokeStyle = '#3a6aff99';
-    overlayCtx.lineWidth = 2;
-    overlayCtx.strokeRect(flip(faceBox.x, faceBox.w), faceBox.y, faceBox.w, faceBox.h);
-  }
+  // Dimmed area outside ROI to focus attention
+  overlayCtx.fillStyle = '#00000044';
+  overlayCtx.fillRect(0, 0, W, y);                   // above ROI
+  overlayCtx.fillRect(0, y + h, W, H - y - h);       // below ROI
+  overlayCtx.fillRect(0, y, x, h);                   // left of ROI
+  overlayCtx.fillRect(x + w, y, W - x - w, h);       // right of ROI
 
-  // ROI box
-  const rx = flip(roi.x, roi.w);
-  overlayCtx.strokeStyle = '#00e676cc';
-  overlayCtx.lineWidth = 2;
-  overlayCtx.setLineDash([5, 3]);
-  overlayCtx.strokeRect(rx, roi.y, roi.w, roi.h);
-  overlayCtx.setLineDash([]);
+  // ROI border — glowing green
+  overlayCtx.strokeStyle = '#00e676';
+  overlayCtx.lineWidth = 2.5;
+  overlayCtx.shadowColor = '#00e676';
+  overlayCtx.shadowBlur = 8;
+  overlayCtx.strokeRect(x, y, w, h);
+  overlayCtx.shadowBlur = 0;
 
-  // ROI label
-  overlayCtx.fillStyle = '#00e676cc';
-  overlayCtx.font = 'bold 11px sans-serif';
-  overlayCtx.fillText('ROI', rx + 4, roi.y - 4);
+  // Corner marks
+  const cs = 16;
+  overlayCtx.strokeStyle = '#00e676';
+  overlayCtx.lineWidth = 3;
+  [[x, y], [x+w, y], [x, y+h], [x+w, y+h]].forEach(([cx, cy], i) => {
+    const dx = i % 2 === 0 ? cs : -cs;
+    const dy = i < 2 ? cs : -cs;
+    overlayCtx.beginPath();
+    overlayCtx.moveTo(cx + dx, cy); overlayCtx.lineTo(cx, cy); overlayCtx.lineTo(cx, cy + dy);
+    overlayCtx.stroke();
+  });
 }
 
 // ═══════════════════════════════════════════════════════════════
