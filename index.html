@@ -725,11 +725,13 @@ async function loop() {
 function getROI() {
   const vw = video.videoWidth, vh = video.videoHeight;
   if (faceBox) {
-    // Forehead: top 25% of face, centered horizontally
-    const x = Math.round(faceBox.x + faceBox.w * 0.25);
-    const y = Math.round(faceBox.y + faceBox.h * 0.05);
-    const w = Math.round(faceBox.w * 0.5);
-    const h = Math.round(faceBox.h * 0.22);
+    // MediaPipe bounding box often starts at eyebrow level and clips the forehead.
+    // Shift the ROI upward so it lands on the actual forehead skin.
+    // Use top 30% of face box height, starting 10% above the box top.
+    const x = Math.round(faceBox.x + faceBox.w * 0.2);
+    const y = Math.round(faceBox.y - faceBox.h * 0.1);  // reach above box top
+    const w = Math.round(faceBox.w * 0.6);
+    const h = Math.round(faceBox.h * 0.28);
     return clampROI({ x, y, w, h }, vw, vh);
   }
   // Fallback: center 30% of frame
@@ -917,7 +919,7 @@ function estimateHRV(pulse, fps) {
 // UI Update
 // ═══════════════════════════════════════════════════════════════
 function updateUI(hr, spo2, hrv, snrDb, confidence, freqs, psd) {
-  const fmt = (v, d) => v > 0 ? v.toFixed(d) : '--';
+  const fmt = (v, d) => v !== 0 ? v.toFixed(d) : '--';
   document.getElementById('hrVal').textContent   = fmt(hr, 0);
   document.getElementById('spo2Val').textContent = fmt(spo2, 1);
   document.getElementById('hrvVal').textContent  = fmt(hrv, 0);
