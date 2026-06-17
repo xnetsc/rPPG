@@ -334,7 +334,7 @@
 const CFG = {
   FPS_TARGET: 30,
   WINDOW_SEC: 10,       // analysis window in seconds
-  SLIDE_SEC: 5,         // how often to update HR
+  SLIDE_SEC: 1,         // how often to update HR
   HR_LOW: 42,
   HR_HIGH: 240,
   FREQ_LOW: 0.7,
@@ -346,6 +346,7 @@ const CFG = {
 // State
 // ═══════════════════════════════════════════════════════════════
 let video, overlay, overlayCtx, sampleCanvas, sampleCtx;
+let extractor = null;        // GPUExtractor instance
 let rgbBuffer = [];          // [{r,g,b,ts}]
 let faceBox = null;          // {x,y,w,h} in video pixels
 let estimatedFps = 30;
@@ -356,6 +357,240 @@ let mediapipeReady = false;
 let lastHrUpdate = 0;
 let lastHeartbeatFlash = 0;
 let pulseSignal = [];
+
+// ═══════════════════════════════════════════════════════════════
+// GPU Pixel Extractor
+// Priority: WebGPU → WebGL2 → JS (Canvas2D getImageData)
+//
+// The bottleneck in pure-JS rPPG is getImageData(): it stalls the CPU
+// waiting for a GPU→CPU pixel transfer of the entire ROI on every frame.
+// GPU backends avoid this:
+//   WebGL2 — renders ROI to a 1×1 FBO (8×8 grid samples), readPixels=4 bytes
+//   WebGPU  — compute shader parallel reduction, readback=12 bytes
+// Both leave signal processing (POS/FFT) in JS, which is fast enough.
+// ═══════════════════════════════════════════════════════════════
+class GPUExtractor {
+  constructor() { this.backend = 'js'; }
+
+  async init(videoEl) {
+    this._video = videoEl;
+
+    // ── Try WebGPU ──────────────────────────────────────────────
+    if (navigator.gpu) {
+      try {
+        const adapter = await navigator.gpu.requestAdapter();
+        if (!adapter) throw new Error('no adapter');
+        const device = await adapter.requestDevice();
+        this._gpuDevice = device;
+        this._initWebGPUPipeline(device);
+        this.backend = 'webgpu';
+        return;
+      } catch (e) { console.warn('WebGPU unavailable:', e.message); }
+    }
+
+    // ── Try WebGL2 ──────────────────────────────────────────────
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = 1; canvas.height = 1;
+      const gl = canvas.getContext('webgl2');
+      if (!gl) throw new Error('no webgl2');
+      this._gl = gl;
+      this._initWebGL2Program(gl);
+      this.backend = 'webgl2';
+      return;
+    } catch (e) { console.warn('WebGL2 unavailable:', e.message); }
+
+    // ── JS fallback ─────────────────────────────────────────────
+    this.backend = 'js';
+  }
+
+  // extract() returns {r,g,b} in [0,255] range
+  async extract(roi, fallbackCtx) {
+    if (this.backend === 'webgpu') return this._extractWebGPU(roi);
+    if (this.backend === 'webgl2') return this._extractWebGL2(roi);
+    return this._extractJS(roi, fallbackCtx);
+  }
+
+  // ── WebGPU ────────────────────────────────────────────────────
+  _initWebGPUPipeline(device) {
+    // Compute shader: 8×8 workgroup samples ROI in an 8×8 grid,
+    // reduces to a single mean RGB via workgroup shared memory.
+    const wgsl = /* wgsl */`
+      @group(0) @binding(0) var vid : texture_external;
+      @group(0) @binding(1) var<uniform> roi : vec4f;   // x,y,w,h pixels
+      @group(0) @binding(2) var<storage, read_write> out : array<f32>; // [r,g,b]
+
+      var<workgroup> sr : array<f32, 64>;
+      var<workgroup> sg : array<f32, 64>;
+      var<workgroup> sb : array<f32, 64>;
+
+      @compute @workgroup_size(8, 8)
+      fn main(@builtin(local_invocation_index) lid: u32,
+              @builtin(global_invocation_id)   gid: vec3u) {
+        let tx = i32(roi.x + roi.z * (f32(gid.x) + 0.5) / 8.0);
+        let ty = i32(roi.y + roi.w * (f32(gid.y) + 0.5) / 8.0);
+        let px = textureLoad(vid, vec2i(tx, ty));
+        sr[lid] = px.r; sg[lid] = px.g; sb[lid] = px.b;
+        workgroupBarrier();
+        for (var s = 32u; s > 0u; s >>= 1u) {
+          if (lid < s) {
+            sr[lid] += sr[lid + s];
+            sg[lid] += sg[lid + s];
+            sb[lid] += sb[lid + s];
+          }
+          workgroupBarrier();
+        }
+        if (lid == 0u) {
+          out[0] = sr[0] / 64.0 * 255.0;
+          out[1] = sg[0] / 64.0 * 255.0;
+          out[2] = sb[0] / 64.0 * 255.0;
+        }
+      }
+    `;
+    const mod = device.createShaderModule({ code: wgsl });
+    this._gpuPipeline = device.createComputePipeline({
+      layout: 'auto',
+      compute: { module: mod, entryPoint: 'main' }
+    });
+    this._roiBuf = device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+    this._outBuf = device.createBuffer({
+      size: 12,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+    });
+    this._readBuf = device.createBuffer({
+      size: 12,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+    });
+  }
+
+  async _extractWebGPU(roi) {
+    const device = this._gpuDevice;
+    device.queue.writeBuffer(this._roiBuf, 0,
+      new Float32Array([roi.x, roi.y, roi.w, roi.h]));
+
+    // importExternalTexture must be used in the same task — submit immediately
+    const vidTex = device.importExternalTexture({ source: this._video });
+    const bg = device.createBindGroup({
+      layout: this._gpuPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: vidTex },
+        { binding: 1, resource: { buffer: this._roiBuf } },
+        { binding: 2, resource: { buffer: this._outBuf } },
+      ]
+    });
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(this._gpuPipeline);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(1);   // single 8×8 workgroup
+    pass.end();
+    enc.copyBufferToBuffer(this._outBuf, 0, this._readBuf, 0, 12);
+    device.queue.submit([enc.finish()]);  // synchronous submit before texture expires
+
+    await this._readBuf.mapAsync(GPUMapMode.READ);
+    const d = new Float32Array(this._readBuf.getMappedRange());
+    const result = { r: d[0], g: d[1], b: d[2] };
+    this._readBuf.unmap();
+    return result;
+  }
+
+  // ── WebGL2 ────────────────────────────────────────────────────
+  _initWebGL2Program(gl) {
+    const vs = `#version 300 es
+      in vec2 pos; void main(){ gl_Position=vec4(pos,0,1); }`;
+    // 8×8 = 64 fixed samples evenly distributed over ROI → compile-time constant loop
+    const fs = `#version 300 es
+      precision highp float;
+      uniform sampler2D u_tex;
+      uniform vec4 u_roi;    // x,y,w,h in pixels
+      uniform vec2 u_size;   // video width,height
+      out vec4 color;
+      void main(){
+        vec3 sum=vec3(0.0);
+        const int N=8;
+        for(int j=0;j<N;j++) for(int i=0;i<N;i++){
+          float u=(u_roi.x+u_roi.z*(float(i)+.5)/float(N))/u_size.x;
+          float v=(u_roi.y+u_roi.w*(float(j)+.5)/float(N))/u_size.y;
+          sum+=texture(u_tex,vec2(u,v)).rgb;
+        }
+        color=vec4(sum/float(N*N),1.0);
+      }`;
+
+    const prog = this._compileGL(gl, vs, fs);
+    this._glProg = prog;
+    gl.useProgram(prog);
+
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER,
+      new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+    const loc = gl.getAttribLocation(prog, 'pos');
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+    this._glTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, this._glTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    const fbTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, fbTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    this._glFbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this._glFbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, fbTex, 0);
+
+    this._glPix = new Uint8Array(4);
+    this._glUTex  = gl.getUniformLocation(prog, 'u_tex');
+    this._glURoi  = gl.getUniformLocation(prog, 'u_roi');
+    this._glUSize = gl.getUniformLocation(prog, 'u_size');
+  }
+
+  _extractWebGL2(roi) {
+    const gl = this._gl;
+    gl.bindTexture(gl.TEXTURE_2D, this._glTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this._video);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this._glFbo);
+    gl.viewport(0, 0, 1, 1);
+    gl.useProgram(this._glProg);
+    gl.uniform1i(this._glUTex, 0);
+    gl.uniform4f(this._glURoi, roi.x, roi.y, roi.w, roi.h);
+    gl.uniform2f(this._glUSize, this._video.videoWidth, this._video.videoHeight);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, this._glPix);
+    return { r: this._glPix[0], g: this._glPix[1], b: this._glPix[2] };
+  }
+
+  _compileGL(gl, vsrc, fsrc) {
+    const compile = (type, src) => {
+      const s = gl.createShader(type);
+      gl.shaderSource(s, src); gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+        throw new Error(gl.getShaderInfoLog(s));
+      return s;
+    };
+    const p = gl.createProgram();
+    gl.attachShader(p, compile(gl.VERTEX_SHADER, vsrc));
+    gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsrc));
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+      throw new Error(gl.getProgramInfoLog(p));
+    return p;
+  }
+
+  // ── JS fallback ───────────────────────────────────────────────
+  _extractJS(roi, ctx) {
+    const d = ctx.getImageData(roi.x, roi.y, roi.w, roi.h).data;
+    let r = 0, g = 0, b = 0, n = d.length / 4;
+    for (let i = 0; i < d.length; i += 4) { r += d[i]; g += d[i+1]; b += d[i+2]; }
+    return { r: r/n, g: g/n, b: b/n };
+  }
+}
 
 // ═══════════════════════════════════════════════════════════════
 // MediaPipe Face Detection loader
@@ -432,7 +667,10 @@ async function startCamera() {
 
     await loadMediaPipe();
 
-    setStatus('warming', '采集中 — 请保持静止…');
+    extractor = new GPUExtractor();
+    await extractor.init(video);
+    const backendLabel = { webgpu: 'WebGPU', webgl2: 'WebGL2', js: 'JS' }[extractor.backend];
+    setStatus('warming', `采集中 — 请保持静止… (${backendLabel})`);
     loop();
   } catch (e) {
     setStatus('', '摄像头权限被拒绝: ' + e.message);
@@ -442,13 +680,13 @@ async function startCamera() {
 // ═══════════════════════════════════════════════════════════════
 // Main loop
 // ═══════════════════════════════════════════════════════════════
-function loop() {
+async function loop() {
   const now = performance.now();
 
-  // 1. Sample frame
-  sampleCtx.drawImage(video, 0, 0);
+  // 1. Sample frame — JS fallback still needs the canvas draw
   const roi = getROI();
-  const rgb = extractMeanRGB(roi);
+  if (extractor.backend === 'js') sampleCtx.drawImage(video, 0, 0);
+  const rgb = await extractor.extract(roi, sampleCtx);
   rgbBuffer.push({ ...rgb, ts: now });
 
   // Trim buffer to window
@@ -587,7 +825,10 @@ function analyse() {
 
   updateUI(hr, spo2, hrv, snrDb, confidence, freqs, psd);
 
-  if (hr > 0) setStatus('active', `心率检测中 · ${slice.length} 帧 · ${fps.toFixed(1)} fps`);
+  if (hr > 0) {
+    const be = extractor ? ({ webgpu: 'WebGPU ⚡', webgl2: 'WebGL2 ⚡', js: 'JS' }[extractor.backend]) : '';
+    setStatus('active', `心率检测中 · ${slice.length} 帧 · ${fps.toFixed(1)} fps · ${be}`);
+  }
 }
 
 function peakHR(freqs, psd, fps) {
