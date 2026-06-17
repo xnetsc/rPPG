@@ -268,7 +268,7 @@
       <div class="card">
         <div class="card-label">🩸 血氧 SpO₂</div>
         <div class="card-value spo2-value" id="spo2Val">--</div>
-        <div class="card-unit">% (估算)</div>
+        <div class="card-unit">% (RGB比值法估算，非医疗级)</div>
         <div class="confidence-bar"><div class="confidence-fill" id="spo2Conf"></div></div>
       </div>
       <div class="card">
@@ -577,8 +577,10 @@ function analyse() {
   const { freqs, psd } = welch(pulse, fps, 256);
   const { hr, snrDb, confidence } = peakHR(freqs, psd, fps);
 
-  // SpO2
-  const spo2 = estimateSpo2(R, G, B);
+  // SpO2 — bandpass R and B at pulse frequency band first for cleaner AC
+  const Rfilt = bandpass(detrend(R), fps, CFG.FREQ_LOW, CFG.FREQ_HIGH);
+  const Bfilt = bandpass(detrend(B), fps, CFG.FREQ_LOW, CFG.FREQ_HIGH);
+  const spo2 = estimateSpo2(R, B, Rfilt, Bfilt);
 
   // HRV (simplified from peak intervals)
   const hrv = estimateHRV(pulse, fps);
@@ -616,12 +618,40 @@ function peakHR(freqs, psd, fps) {
   return { hr, snrDb, confidence };
 }
 
-function estimateSpo2(R, G, B) {
-  if (R.length < 10) return 0;
-  const mu_r = mean(R) || 1e-6, mu_b = mean(B) || 1e-6;
-  const ac_r = std(R) || 1e-6, ac_b = std(B) || 1e-6;
-  const ratio = (ac_r / mu_r) / (ac_b / mu_b);
-  return Math.max(80, Math.min(100, 110 - 25 * ratio));
+/**
+ * SpO2 proxy via Beer-Lambert RGB ratio method.
+ *
+ * Pulse oximeters compute:  R_ratio = (AC_red/DC_red) / (AC_ir/DC_ir)
+ * A standard RGB camera has no NIR channel, so we substitute blue (~450 nm)
+ * for infrared (~940 nm) as the reference channel. This is physically
+ * imprecise but gives a plausible trend for demonstration.
+ *
+ * AC is extracted from the bandpass-filtered signal (pulse band 0.7-4 Hz)
+ * to avoid motion / illumination noise contaminating the ratio.
+ * DC is the raw channel mean (slow baseline).
+ *
+ * Empirical calibration curve (Mendelson & Kent 1989 approximation):
+ *   SpO2 ≈ 110 − 25 × R_ratio
+ *
+ * Result is clamped to [80, 100] % and smoothed across calls.
+ */
+let _spo2Smooth = 0;
+function estimateSpo2(R, B, Rfilt, Bfilt) {
+  if (R.length < 16) return 0;
+
+  const dc_r = mean(R) || 1e-6;
+  const dc_b = mean(B) || 1e-6;
+
+  // RMS amplitude of bandpass signal as AC estimate (more stable than std)
+  const ac_r = Math.sqrt(mean(Rfilt.map(v => v * v))) || 1e-6;
+  const ac_b = Math.sqrt(mean(Bfilt.map(v => v * v))) || 1e-6;
+
+  const ratio = (ac_r / dc_r) / (ac_b / dc_b);
+  const raw = Math.max(80, Math.min(100, 110 - 25 * ratio));
+
+  // Exponential moving average to reduce jitter
+  _spo2Smooth = _spo2Smooth === 0 ? raw : 0.85 * _spo2Smooth + 0.15 * raw;
+  return _spo2Smooth;
 }
 
 function estimateHRV(pulse, fps) {
@@ -914,6 +944,7 @@ function setStatus(state, text) {
 function resetBuffers() {
   rgbBuffer = [];
   pulseSignal = [];
+  _spo2Smooth = 0;
   faceBox = null;
   ['hrVal','spo2Val','hrvVal','snrVal'].forEach(id => {
     document.getElementById(id).textContent = '--';
