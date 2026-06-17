@@ -729,19 +729,16 @@ async function loop() {
 // ═══════════════════════════════════════════════════════════════
 function getROI() {
   const vw = video.videoWidth, vh = video.videoHeight;
-  if (faceBox) {
-    // MediaPipe bounding box often starts at eyebrow level and clips the forehead.
-    // Shift the ROI upward so it lands on the actual forehead skin.
-    // Use top 30% of face box height, starting 10% above the box top.
-    const x = Math.round(faceBox.x + faceBox.w * 0.2);
-    const y = Math.round(faceBox.y - faceBox.h * 0.1);  // reach above box top
-    const w = Math.round(faceBox.w * 0.6);
-    const h = Math.round(faceBox.h * 0.28);
-    return clampROI({ x, y, w, h }, vw, vh);
-  }
-  // Fallback: center 30% of frame
-  const w = Math.round(vw * 0.3), h = Math.round(vh * 0.3);
-  return { x: Math.round((vw - w) / 2), y: Math.round((vh - h) / 2), w, h };
+  // MediaPipe short-model bounding boxes often only cover the lower face
+  // (nose→chin), making face-relative forehead math unreliable.
+  // For selfie mode the forehead is always in the upper-center of the frame,
+  // so we use a fixed region there and only use face detection for x-centering.
+  const cx = faceBox ? (faceBox.x + faceBox.w / 2) : vw / 2;
+  const w = Math.round(vw * 0.48);
+  const h = Math.round(vh * 0.22);
+  const x = Math.round(cx - w / 2);
+  const y = Math.round(vh * 0.06);          // top 6–28% = forehead region
+  return clampROI({ x, y, w, h }, vw, vh);
 }
 
 function clampROI(r, vw, vh) {
